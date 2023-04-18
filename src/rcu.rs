@@ -31,7 +31,6 @@ impl<T> Drop for Rcu<T> {
 impl<T> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.body.counter.fetch_add(1, Ordering::Relaxed);
         let next = self.body.value.next.load(Ordering::Acquire);
         if next.is_null() {
             unsafe { &*self.body.value.current.get() }
@@ -41,20 +40,14 @@ impl<T> Deref for Rcu<T> {
     }
 }
 
-impl<T> std::borrow::Borrow<T> for Rcu<T> {
-    fn borrow(&self) -> &T {
-        &**self
-    }
-}
-
 impl<'a, T: Clone> Rcu<T> {
-    pub fn new(x: T) -> Self {
+    pub fn new(v: T) -> Self {
         Rcu {
             body: Arc::new(RcuBody {
                 counter: AtomicUsize::new(0),
                 updating: AtomicBool::new(false),
                 value: Value {
-                    current: UnsafeCell::new(x),
+                    current: UnsafeCell::new(v),
                     next: AtomicPtr::new(null_mut()),
                 },
             }),
@@ -65,9 +58,10 @@ impl<'a, T: Clone> Rcu<T> {
         self.clone()
     }
 
-    pub fn assign_pointer(&'a self) -> RcuGuard<'a, T> {
+    pub fn assign_pointer(&'a self) -> Option<RcuGuard<'a, T>> {
         if self.body.updating.swap(true, Ordering::Relaxed) {
-            panic!("Cannont update an Rcu twice simultaneously.");
+            eprintln!("Error: updating Rcu ...");
+            return None;
         }
 
         let new_value = Value {
@@ -75,29 +69,19 @@ impl<'a, T: Clone> Rcu<T> {
             next: AtomicPtr::new(self.body.value.next.load(Ordering::Acquire)),
         };
 
-        RcuGuard {
+        Some(RcuGuard {
             value: Some(new_value),
             body: &self.body,
-        }
+        })
     }
 
     pub fn clean(&mut self) {
         let counter = self.body.counter.load(Ordering::Relaxed);
         let next = self.body.value.next.load(Ordering::Acquire);
-        if counter == 0 && !next.is_null() {
+        if counter == 1 && !next.is_null() {
             unsafe {
-                let buffer: UnsafeCell<Option<T>> = UnsafeCell::new(None);
-                std::ptr::copy_nonoverlapping(
-                    self.body.value.current.get(),
-                    buffer.get() as *mut T,
-                    1,
-                );
-                std::ptr::copy_nonoverlapping((*next).current.get(), self.body.value.current.get(), 1);
-                let _to_be_freed =
-                    Box::from_raw(self.body.value.next.swap(null_mut(), Ordering::Release));
-                std::ptr::copy_nonoverlapping(buffer.get() as *mut T, (*next).current.get(), 1);
-                let buffer_copy: UnsafeCell<Option<T>> = UnsafeCell::new(None);
-                std::ptr::copy_nonoverlapping(buffer_copy.get(), buffer.get(), 1);
+                let _ = Box::from_raw(self.body.value.next.swap(null_mut(), Ordering::Release));
+                std::mem::swap(&mut *self.body.value.current.get(), &mut *(*next).current.get());
             }
         }
     }
@@ -121,7 +105,7 @@ impl<T> Drop for Value<T> {
     fn drop(&mut self) {
         let next = self.next.load(Ordering::Acquire);
         if !next.is_null() {
-            let _free_this = unsafe { Box::from_raw(next) };
+            let _ = unsafe { Box::from_raw(next) };
         }
     }
 }
@@ -161,7 +145,7 @@ impl<'a, T: Clone> Drop for RcuGuard<'a, T> {
         self.body
             .value
             .next
-            .store(Box::into_raw(Box::new(value.unwrap())), Ordering::Release);
+            .store(Box::into_raw(Box::new(value.expect("Value should not be None"))), Ordering::Release);
         self.body.updating.store(false, Ordering::Relaxed);
     }
 }

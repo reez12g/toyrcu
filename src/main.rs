@@ -4,7 +4,7 @@ use rcu::Rcu;
 use std::{thread, time::Duration};
 
 fn main() {
-    let rcu = Rcu::new(42);
+    let rcu = Rcu::new(1);
 
     let reader = thread::spawn({
         let rcu = rcu.read_lock();
@@ -22,7 +22,12 @@ fn main() {
         move || {
             for i in 0..5 {
                 {
-                    let mut rcu_guard = rcu.assign_pointer();
+                    let mut rcu_guard = match rcu.assign_pointer() {
+                        Some(guard) => guard,
+                        None => {
+                            return;
+                        }
+                    };
                     *rcu_guard += i;
                     println!("Writer: {:?}", *rcu_guard);
                 }
