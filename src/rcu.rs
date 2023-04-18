@@ -1,6 +1,6 @@
 use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, AtomicPtr, Ordering}};
 use std::ptr::null_mut;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 
 //----------------------------------
@@ -8,7 +8,6 @@ use std::ops::{Deref, DerefMut};
 //----------------------------------
 pub struct Rcu<T> {
     body: Arc<RcuBody<T>>,
-    have_borrowed: Cell<bool>,
 }
 
 unsafe impl<T: Send + Sync> Send for Rcu<T> {}
@@ -16,20 +15,23 @@ unsafe impl<T: Send + Sync> Sync for Rcu<T> {}
 
 impl<T: Clone> Clone for Rcu<T> {
     fn clone(&self) -> Self {
+        self.body.counter.fetch_add(1, Ordering::Relaxed);
         Rcu {
             body: self.body.clone(),
-            have_borrowed: Cell::new(false),
         }
+    }
+}
+
+impl<T> Drop for Rcu<T> {
+    fn drop(&mut self) {
+        self.body.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl<T> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        if !self.have_borrowed.get() {
-            self.body.counter.fetch_add(1, Ordering::Relaxed);
-            self.have_borrowed.set(true);
-        }
+        self.body.counter.fetch_add(1, Ordering::Relaxed);
         let next = self.body.value.next.load(Ordering::Acquire);
         if next.is_null() {
             unsafe { &*self.body.value.current.get() }
@@ -48,7 +50,6 @@ impl<T> std::borrow::Borrow<T> for Rcu<T> {
 impl<'a, T: Clone> Rcu<T> {
     pub fn new(x: T) -> Self {
         Rcu {
-            have_borrowed: Cell::new(false),
             body: Arc::new(RcuBody {
                 counter: AtomicUsize::new(0),
                 updating: AtomicBool::new(false),
@@ -81,11 +82,6 @@ impl<'a, T: Clone> Rcu<T> {
     }
 
     pub fn clean(&mut self) {
-        let aleady_borrowed = self.have_borrowed.get();
-        if aleady_borrowed {
-            self.body.counter.fetch_sub(1, Ordering::Relaxed);
-            self.have_borrowed.set(false);
-        }
         let counter = self.body.counter.load(Ordering::Relaxed);
         let next = self.body.value.next.load(Ordering::Acquire);
         if counter == 0 && !next.is_null() {
