@@ -36,26 +36,20 @@ impl<'a, T: Clone> Rcu<T> {
             body: Arc::new(RcuBody {
                 data: RefCell::new(data),
                 next: AtomicPtr::new(null_mut()),
-                counter: AtomicUsize::new(0),
             }),
         }
     }
 
     // ReaderがRCUで保護されたデータへのReadを開始することを示す。
-    pub fn read_lock(&self) {
-        self.body.counter.fetch_add(1, Ordering::Acquire);
-    }
-
-    // ReaderがCritical Sectionを抜けたことを示す。
-    pub fn read_unlock(&self) {
-        self.body.counter.fetch_sub(1, Ordering::Release);
+    pub fn read_lock(&self) -> Self {
+        Rcu {
+            body: Arc::clone(&self.body),
+        }
     }
 
     // 全てのReaderがQuiescent Stateになるまで待機する。
     pub fn synchronize(&self) {
-        while self.body.counter.load(Ordering::Acquire) != 0 {
-            core::hint::spin_loop();
-        }
+        core::hint::spin_loop();
     }
 
     // UpdaterがRCUで保護されたデータに新しい値を割り当てる。
@@ -72,5 +66,4 @@ impl<'a, T: Clone> Rcu<T> {
 pub struct RcuBody<T> {
     data: RefCell<T>,
     next: AtomicPtr<T>,
-    counter: AtomicUsize,
 }
