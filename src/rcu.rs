@@ -26,8 +26,7 @@ impl<T: Clone> Clone for Rcu<T> {
 impl<T> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        let aleady_borrowed = self.have_borrowed.get();
-        if !aleady_borrowed {
+        if !self.have_borrowed.get() {
             self.body.counter.fetch_add(1, Ordering::Relaxed);
             self.have_borrowed.set(true);
         }
@@ -69,11 +68,14 @@ impl<'a, T: Clone> Rcu<T> {
         if self.body.updating.swap(true, Ordering::Relaxed) {
             panic!("Cannont update an Rcu twice simultaneously.");
         }
+
+        let new_value = Value {
+            current: UnsafeCell::new((*(*self)).clone()),
+            next: AtomicPtr::new(self.body.value.next.load(Ordering::Acquire)),
+        };
+
         RcuGuard {
-            value: Some(Value {
-                current: UnsafeCell::new((*(*self)).clone()),
-                next: AtomicPtr::new(self.body.value.next.load(Ordering::Acquire)),
-            }),
+            value: Some(new_value),
             body: &self.body,
         }
     }
