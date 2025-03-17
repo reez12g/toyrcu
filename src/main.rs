@@ -23,8 +23,9 @@ fn main() {
             for i in 0..5 {
                 {
                     let mut rcu_guard = match rcu.assign_pointer() {
-                        Some(guard) => guard,
-                        None => {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            eprintln!("Error: {}", e);
                             return;
                         }
                     };
