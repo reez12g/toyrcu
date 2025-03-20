@@ -26,7 +26,7 @@ impl std::error::Error for RcuError {}
 //----------------------------------
 /// A concurrent data structure that allows readers to access data
 /// without blocking writers and vice versa.
-/// 
+///
 /// The `Rcu<T>` type provides a way to read data concurrently while updates
 /// happen in the background, with updates becoming visible to new readers
 /// once they complete.
@@ -123,7 +123,7 @@ impl<'a, T: Clone> Rcu<T> {
     pub fn clean(&mut self) {
         let counter = self.body.counter.load(Ordering::Relaxed);
         let next = self.body.value.next.load(Ordering::Acquire);
-        
+
         // Only clean if this is the sole reference and there's a next value
         if counter == 1 && !next.is_null() {
             unsafe {
@@ -131,7 +131,7 @@ impl<'a, T: Clone> Rcu<T> {
                 let next_val = (*next).current.get();
                 let current_val = self.body.value.current.get();
                 *current_val = (*next_val).clone();
-                
+
                 // Then remove the next pointer
                 let _ = Box::from_raw(self.body.value.next.swap(null_mut(), Ordering::Release));
             }
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_basic_functionality() {
         let rcu = Rcu::new(42);
-        
+
         // Read value through pointer dereference
         unsafe {
             assert_eq!(*rcu.body.value.current.get(), 42);
@@ -231,7 +231,7 @@ mod tests {
             let mut guard = rcu.assign_pointer().unwrap();
             *guard = 100;
         }
-        
+
         // Check value was updated
         unsafe {
             let next = rcu.body.value.next.load(Ordering::Acquire);
@@ -243,20 +243,20 @@ mod tests {
     #[test]
     fn test_error_on_double_update() {
         let rcu = Rcu::new(0);
-        
+
         // First update should succeed
         let guard = rcu.assign_pointer().unwrap();
-        
+
         // Second update should fail with AlreadyUpdating error
         let result = rcu.assign_pointer();
         assert!(result.is_err());
         if let Err(e) = result {
             assert!(matches!(e, RcuError::AlreadyUpdating));
         }
-        
+
         // Drop the first guard
         drop(guard);
-        
+
         // Now we should be able to update again
         assert!(rcu.assign_pointer().is_ok());
     }
@@ -264,28 +264,28 @@ mod tests {
     #[test]
     fn test_cleanup() {
         let mut rcu = Rcu::new(1);
-        
+
         // Make some updates
         {
             let mut guard = rcu.assign_pointer().unwrap();
             *guard = 2;
         }
-        
+
         {
             let mut guard = rcu.assign_pointer().unwrap();
             *guard = 3;
         }
-        
+
         // Verify the value through deref
         unsafe {
             let next = rcu.body.value.next.load(Ordering::Acquire);
             assert!(!next.is_null());
             assert_eq!(*(*next).current.get(), 3);
         }
-        
+
         // Clean up old versions
         rcu.clean();
-        
+
         // Read the actual current value after cleanup
         unsafe {
             let val = *rcu.body.value.current.get();
@@ -296,7 +296,7 @@ mod tests {
     #[test]
     fn test_multiple_readers() {
         let rcu = Arc::new(Rcu::new(0));
-        
+
         // Start a writer that increments the value
         let writer_rcu = Arc::clone(&rcu);
         let writer = thread::spawn(move || {
@@ -304,7 +304,7 @@ mod tests {
             let mut guard = writer_rcu.assign_pointer().unwrap();
             *guard = 42;
         });
-        
+
         // Start multiple readers that read the value
         let mut readers = vec![];
         for _ in 0..5 {
@@ -312,7 +312,7 @@ mod tests {
             readers.push(thread::spawn(move || {
                 // Sleep to ensure some reads happen before and some after the write
                 thread::sleep(Duration::from_millis(100));
-                
+
                 // Read current value through direct access to verify it's valid
                 unsafe {
                     let next = reader_rcu.body.value.next.load(Ordering::Acquire);
@@ -321,19 +321,19 @@ mod tests {
                     } else {
                         *(*next).current.get()
                     };
-                    
+
                     // Value should be either 0 or 42
                     assert!(val == 0 || val == 42);
                 }
             }));
         }
-        
+
         // Wait for all threads to complete
         writer.join().unwrap();
         for reader in readers {
             reader.join().unwrap();
         }
-        
+
         // Final value should be 42 - check through direct access
         unsafe {
             let next = rcu.body.value.next.load(Ordering::Acquire);
