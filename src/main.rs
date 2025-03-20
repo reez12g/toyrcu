@@ -32,7 +32,8 @@ fn main() {
                     *rcu_guard += i;
                     println!("Writer: {:?}", *rcu_guard);
                 }
-                rcu.clean();
+                // Use the more efficient cleanup method
+                rcu.try_clean_fast();
                 thread::sleep(Duration::from_millis(1000));
             }
         }
