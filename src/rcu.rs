@@ -131,6 +131,7 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
         Ok(RcuGuard {
             value: Some(new_value),
             body: &self.body,
+            original_value: current_value,
         })
     }
 
@@ -140,6 +141,8 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// to reclaim memory used by old versions.
     /// This implementation ensures the entire chain of old data is cleaned up,
     /// preventing memory leaks when multiple updates occur without cleanup.
+    ///
+    /// This implementation uses memory swapping to avoid unnecessary cloning.
     pub fn clean(&mut self) {
         // Fast path: if there's no next pointer, nothing to clean
         let next = self.body.value.next.load(Ordering::Acquire);
@@ -154,35 +157,37 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
         }
 
         unsafe {
-            // First update the current value with the next value
-            let next_val = (*next).current.get();
-            let current_val = self.body.value.current.get();
+            // Move the next value into current instead of cloning
+            let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Release);
+            if !next_ptr.is_null() {
+                // Get the first node in the chain
+                let next_box = Box::from_raw(next_ptr);
+                let current_ptr = self.body.value.current.get();
 
-            // Use ptr::copy for potentially more efficient memory copying
-            // instead of clone (though this depends on the type)
-            *current_val = (*next_val).clone();
+                // Swap the values to avoid cloning
+                mem::swap(&mut *current_ptr, &mut *next_box.current.get());
 
-            // Then remove the next pointer with Release ordering to ensure
-            // the current value update is visible
-            let old_next = self.body.value.next.swap(null_mut(), Ordering::Release);
+                // Get the next pointer in the chain before we drop the current node
+                let mut chain_ptr = next_box.next.load(Ordering::Acquire);
 
-            // Free the old next value and its entire chain
-            if !old_next.is_null() {
-                // We need to manually clean up the entire chain
-                let mut current_ptr = old_next;
+                // Clear the next pointer to prevent recursive drop from the first node
+                next_box.next.store(null_mut(), Ordering::Relaxed);
 
-                while !current_ptr.is_null() {
+                // next_box will be dropped here, cleaning up its resources
+
+                // Now clean up the rest of the chain
+                while !chain_ptr.is_null() {
                     // Get the next pointer before we drop the current one
-                    let next_ptr = (*current_ptr).next.load(Ordering::Acquire);
+                    let next_in_chain = (*chain_ptr).next.load(Ordering::Acquire);
 
                     // Clear the next pointer to prevent recursive drop
-                    (*current_ptr).next.store(null_mut(), Ordering::Relaxed);
+                    (*chain_ptr).next.store(null_mut(), Ordering::Relaxed);
 
                     // Drop the current node
-                    drop(Box::from_raw(current_ptr));
+                    drop(Box::from_raw(chain_ptr));
 
                     // Move to the next node
-                    current_ptr = next_ptr;
+                    chain_ptr = next_in_chain;
                 }
             }
         }
@@ -299,6 +304,7 @@ impl<T: PartialEq> Drop for Value<T> {
 pub struct RcuGuard<'a, T: Clone + PartialEq> {
     value: Option<Value<T>>,
     body: &'a RcuBody<T>,
+    original_value: &'a T,
 }
 
 impl<'a, T: Clone + PartialEq> Deref for RcuGuard<'a, T> {
@@ -320,12 +326,12 @@ impl<'a, T: Clone + PartialEq> Drop for RcuGuard<'a, T> {
     fn drop(&mut self) {
         if let Some(value) = self.value.take() {
             // Check if the value was actually modified by comparing with the original
-            let current_value = unsafe { &*self.body.value.current.get() };
+            // We use the stored original_value reference instead of fetching it again
             let new_value = unsafe { &*value.current.get() };
 
             // Only allocate and update if the value actually changed
             // This optimization avoids unnecessary allocations and atomic operations
-            if current_value != new_value {
+            if self.original_value != new_value {
                 // Set the next pointer to the new value
                 let boxed_value = Box::new(value);
                 let raw_ptr = Box::into_raw(boxed_value);
