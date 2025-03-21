@@ -58,8 +58,9 @@ impl<T: PartialEq> Drop for Rcu<T> {
 impl<T: PartialEq> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // Use Relaxed ordering for the initial load since we'll do a proper Acquire fence below
-        let next = self.body.value.next.load(Ordering::Relaxed);
+        // Use Acquire ordering for the load to ensure proper synchronization
+        // with stores that use Release ordering
+        let next = self.body.value.next.load(Ordering::Acquire);
 
         // Fast path: if next is null, just return the current value
         if next.is_null() {
@@ -67,9 +68,8 @@ impl<T: PartialEq> Deref for Rcu<T> {
             // which are serialized with the updating flag
             unsafe { &*self.body.value.current.get() }
         } else {
-            // Only use Acquire ordering when we actually need to read from next
-            std::sync::atomic::fence(Ordering::Acquire);
             // If next is not null, read from the next value
+            // Acquire ordering ensures we see all changes made before the store
             unsafe { &*(*next).current.get() }
         }
     }
@@ -116,9 +116,9 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             return Err(RcuError::AlreadyUpdating);
         }
 
-        // Use relaxed ordering for the next pointer load since we're already
-        // holding the updating lock
-        let next_ptr = self.body.value.next.load(Ordering::Relaxed);
+        // Use Acquire ordering for the next pointer load for consistency
+        // with other next pointer loads in the codebase
+        let next_ptr = self.body.value.next.load(Ordering::Acquire);
 
         // Create a new value by cloning the current one
         // We'll optimize to avoid cloning when possible in the guard's drop
@@ -142,7 +142,7 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// preventing memory leaks when multiple updates occur without cleanup.
     pub fn clean(&mut self) {
         // Fast path: if there's no next pointer, nothing to clean
-        let next = self.body.value.next.load(Ordering::Relaxed);
+        let next = self.body.value.next.load(Ordering::Acquire);
         if next.is_null() {
             return;
         }
@@ -153,9 +153,6 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             return;
         }
 
-        // Use Acquire ordering when we're actually going to read from next
-        std::sync::atomic::fence(Ordering::Acquire);
-
         unsafe {
             // First update the current value with the next value
             let next_val = (*next).current.get();
@@ -165,10 +162,9 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             // instead of clone (though this depends on the type)
             *current_val = (*next_val).clone();
 
-            // Then remove the next pointer with a Release fence to ensure
+            // Then remove the next pointer with Release ordering to ensure
             // the current value update is visible
-            std::sync::atomic::fence(Ordering::Release);
-            let old_next = self.body.value.next.swap(null_mut(), Ordering::Relaxed);
+            let old_next = self.body.value.next.swap(null_mut(), Ordering::Release);
 
             // Free the old next value and its entire chain
             if !old_next.is_null() {
@@ -200,7 +196,7 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// Returns true if cleanup was performed.
     #[inline]
     pub fn try_clean_fast(&mut self) -> bool {
-        let next = self.body.value.next.load(Ordering::Relaxed);
+        let next = self.body.value.next.load(Ordering::Acquire);
         if next.is_null() {
             return false;
         }
@@ -219,7 +215,7 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
 
         unsafe {
             // Move the next value into current instead of cloning
-            let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Relaxed);
+            let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Release);
             if !next_ptr.is_null() {
                 // Get the first node in the chain
                 let next_box = Box::from_raw(next_ptr);
@@ -340,9 +336,9 @@ impl<'a, T: Clone + PartialEq> Drop for RcuGuard<'a, T> {
             }
         }
 
-        // Release the updating lock with Relaxed ordering
-        // since we've already ensured proper synchronization above
-        self.body.updating.store(false, Ordering::Relaxed);
+        // Release the updating lock with Release ordering
+        // to ensure all changes are visible to subsequent operations
+        self.body.updating.store(false, Ordering::Release);
     }
 }
 
