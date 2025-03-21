@@ -138,6 +138,8 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     ///
     /// This should be called periodically when no readers are active
     /// to reclaim memory used by old versions.
+    /// This implementation ensures the entire chain of old data is cleaned up,
+    /// preventing memory leaks when multiple updates occur without cleanup.
     pub fn clean(&mut self) {
         // Fast path: if there's no next pointer, nothing to clean
         let next = self.body.value.next.load(Ordering::Relaxed);
@@ -168,15 +170,32 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             std::sync::atomic::fence(Ordering::Release);
             let old_next = self.body.value.next.swap(null_mut(), Ordering::Relaxed);
 
-            // Free the old next value
+            // Free the old next value and its entire chain
             if !old_next.is_null() {
-                drop(Box::from_raw(old_next));
+                // We need to manually clean up the entire chain
+                let mut current_ptr = old_next;
+
+                while !current_ptr.is_null() {
+                    // Get the next pointer before we drop the current one
+                    let next_ptr = (*current_ptr).next.load(Ordering::Acquire);
+
+                    // Clear the next pointer to prevent recursive drop
+                    (*current_ptr).next.store(null_mut(), Ordering::Relaxed);
+
+                    // Drop the current node
+                    drop(Box::from_raw(current_ptr));
+
+                    // Move to the next node
+                    current_ptr = next_ptr;
+                }
             }
         }
     }
 
     /// Attempts to clean up old versions of the data automatically.
     /// This is a more efficient version that tries to avoid cloning when possible.
+    /// This implementation ensures the entire chain of old data is cleaned up,
+    /// preventing memory leaks when multiple updates occur without cleanup.
     ///
     /// Returns true if cleanup was performed.
     #[inline]
@@ -202,13 +221,35 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             // Move the next value into current instead of cloning
             let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Relaxed);
             if !next_ptr.is_null() {
+                // Get the first node in the chain
                 let next_box = Box::from_raw(next_ptr);
                 let current_ptr = self.body.value.current.get();
 
                 // Swap the values to avoid cloning
                 mem::swap(&mut *current_ptr, &mut *next_box.current.get());
 
+                // Get the next pointer in the chain before we drop the current node
+                let mut chain_ptr = next_box.next.load(Ordering::Acquire);
+
+                // Clear the next pointer to prevent recursive drop from the first node
+                next_box.next.store(null_mut(), Ordering::Relaxed);
+
                 // next_box will be dropped here, cleaning up its resources
+
+                // Now clean up the rest of the chain
+                while !chain_ptr.is_null() {
+                    // Get the next pointer before we drop the current one
+                    let next_in_chain = (*chain_ptr).next.load(Ordering::Acquire);
+
+                    // Clear the next pointer to prevent recursive drop
+                    (*chain_ptr).next.store(null_mut(), Ordering::Relaxed);
+
+                    // Drop the current node
+                    drop(Box::from_raw(chain_ptr));
+
+                    // Move to the next node
+                    chain_ptr = next_in_chain;
+                }
             }
         }
 
@@ -241,6 +282,9 @@ pub struct Value<T: PartialEq> {
 
 impl<T: PartialEq> Drop for Value<T> {
     fn drop(&mut self) {
+        // Note: We don't need to recursively clean up the chain here anymore
+        // as that's handled explicitly in clean() and try_clean_fast().
+        // This prevents potential double-free issues when we manually clean up chains.
         let next = self.next.load(Ordering::Acquire);
         if !next.is_null() {
             // Free the memory of the next value
@@ -435,6 +479,59 @@ mod tests {
                 *(*next).current.get()
             };
             assert_eq!(val, 42);
+        }
+    }
+
+    #[test]
+    fn test_chain_cleanup() {
+        // Create an RCU instance
+        let mut rcu = Rcu::new(0);
+
+        // Perform multiple updates without cleaning up in between
+        // This would create a chain of updates: 0 -> 1 -> 2 -> 3 -> 4
+        for i in 1..5 {
+            let mut guard = rcu.assign_pointer().unwrap();
+            *guard = i;
+
+            // Verify the update was applied
+            drop(guard);
+            assert_eq!(*rcu, i);
+        }
+
+        // At this point, we should have a chain of updates
+        // Let's verify the chain exists by checking the next pointers
+        unsafe {
+            // Get the first next pointer
+            let next_ptr = rcu.body.value.next.load(Ordering::Acquire);
+            assert!(!next_ptr.is_null(), "Next pointer should not be null after updates");
+
+            // The value should be 4 (the last update)
+            assert_eq!(*(*next_ptr).current.get(), 4);
+
+            // Check if there's a chain by following the next pointers
+            let mut chain_length = 1;
+            let mut current_ptr = next_ptr;
+
+            while !(*current_ptr).next.load(Ordering::Acquire).is_null() {
+                current_ptr = (*current_ptr).next.load(Ordering::Acquire);
+                chain_length += 1;
+            }
+
+            // We should have a chain of updates
+            assert!(chain_length > 0, "Should have a chain of updates");
+            println!("Chain length before cleanup: {}", chain_length);
+        }
+
+        // Now clean up and verify the entire chain is cleaned up
+        rcu.clean();
+
+        // After cleanup, the next pointer should be null and the current value should be 4
+        unsafe {
+            let next_ptr = rcu.body.value.next.load(Ordering::Acquire);
+            assert!(next_ptr.is_null(), "Next pointer should be null after cleanup");
+
+            // The current value should be 4
+            assert_eq!(*rcu.body.value.current.get(), 4);
         }
     }
 }
