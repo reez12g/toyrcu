@@ -31,14 +31,40 @@ impl std::error::Error for RcuError {}
 /// The `Rcu<T>` type provides a way to read data concurrently while updates
 /// happen in the background, with updates becoming visible to new readers
 /// once they complete.
+///
+/// # Important: Memory Management
+///
+/// When cloning an `Rcu<T>` instance, old data is not automatically cleaned up
+/// until you explicitly call `clean()` or `try_clean_fast()` on a mutable reference.
+/// Failure to do so may result in memory leaks as old versions of the data will
+/// be retained.
+///
+/// ```
+/// # use toyrcu::rcu::Rcu;
+/// let mut rcu = Rcu::new(42);
+///
+/// // After updates, remember to clean up when possible
+/// {
+///     let mut guard = rcu.assign_pointer().unwrap();
+///     *guard = 100;
+/// }
+///
+/// // Call clean() or try_clean_fast() to release old data
+/// rcu.try_clean_fast();
+/// ```
+///
+/// The Drop implementation will attempt to clean up automatically when an instance
+/// is dropped, but this is only possible when there are no other active references.
+/// For best results, avoid keeping clones for extended periods, or ensure you call
+/// clean() periodically.
 #[derive(Debug)]
-pub struct Rcu<T: PartialEq> {
+pub struct Rcu<T: Clone + PartialEq> {
     body: Arc<RcuBody<T>>,
 }
 
 // Safety: Rcu<T> is Send and Sync if T is Send and Sync
-unsafe impl<T: Send + Sync + PartialEq> Send for Rcu<T> {}
-unsafe impl<T: Send + Sync + PartialEq> Sync for Rcu<T> {}
+unsafe impl<T: Send + Sync + Clone + PartialEq> Send for Rcu<T> {}
+unsafe impl<T: Send + Sync + Clone + PartialEq> Sync for Rcu<T> {}
 
 impl<T: Clone + PartialEq> Clone for Rcu<T> {
     fn clone(&self) -> Self {
@@ -49,13 +75,18 @@ impl<T: Clone + PartialEq> Clone for Rcu<T> {
     }
 }
 
-impl<T: PartialEq> Drop for Rcu<T> {
+impl<T: Clone + PartialEq> Drop for Rcu<T> {
     fn drop(&mut self) {
+        // First decrement the reference counter
         self.body.counter.fetch_sub(1, Ordering::Relaxed);
+
+        // Attempt to clean up automatically when dropped
+        // This will only succeed if this is the last reference
+        self.try_clean_fast();
     }
 }
 
-impl<T: PartialEq> Deref for Rcu<T> {
+impl<T: Clone + PartialEq> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
         // Use Acquire ordering for the load to ensure proper synchronization
@@ -94,6 +125,12 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     ///
     /// This increments the internal reference counter to prevent
     /// cleanup while references are still active.
+    ///
+    /// # Note
+    ///
+    /// The returned clone should either be short-lived or you should
+    /// call `clean()` or `try_clean_fast()` periodically to prevent
+    /// memory leaks from old data versions.
     #[inline]
     pub fn read_lock(&self) -> Self {
         self.clone()
@@ -143,6 +180,12 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// preventing memory leaks when multiple updates occur without cleanup.
     ///
     /// This implementation uses memory swapping to avoid unnecessary cloning.
+    ///
+    /// # Important
+    ///
+    /// You MUST call this method (or `try_clean_fast()`) periodically on clones
+    /// to prevent memory leaks. Each clone maintains references to old data until
+    /// explicitly cleaned up.
     pub fn clean(&mut self) {
         // Fast path: if there's no next pointer, nothing to clean
         let next = self.body.value.next.load(Ordering::Acquire);
@@ -199,6 +242,15 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// preventing memory leaks when multiple updates occur without cleanup.
     ///
     /// Returns true if cleanup was performed.
+    ///
+    /// # Important
+    ///
+    /// You MUST call this method (or `clean()`) periodically on clones
+    /// to prevent memory leaks. Each clone maintains references to old data until
+    /// explicitly cleaned up.
+    ///
+    /// This method is automatically called when an `Rcu` instance is dropped,
+    /// but cleanup will only succeed if there are no other active references.
     #[inline]
     pub fn try_clean_fast(&mut self) -> bool {
         let next = self.body.value.next.load(Ordering::Acquire);
@@ -265,7 +317,7 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
 //----------------------------------
 /// Internal structure that holds the actual data and synchronization primitives.
 #[derive(Debug)]
-pub struct RcuBody<T: PartialEq> {
+pub struct RcuBody<T: Clone + PartialEq> {
     /// Number of active references to this RCU
     counter: AtomicUsize,
     /// Flag indicating if an update is in progress
@@ -276,12 +328,12 @@ pub struct RcuBody<T: PartialEq> {
 
 /// Holds a value and a pointer to a potential next value.
 #[derive(Debug)]
-pub struct Value<T: PartialEq> {
+pub struct Value<T: Clone + PartialEq> {
     current: UnsafeCell<T>,
     next: AtomicPtr<Value<T>>,
 }
 
-impl<T: PartialEq> Drop for Value<T> {
+impl<T: Clone + PartialEq> Drop for Value<T> {
     fn drop(&mut self) {
         // Note: We don't need to recursively clean up the chain here anymore
         // as that's handled explicitly in clean() and try_clean_fast().
