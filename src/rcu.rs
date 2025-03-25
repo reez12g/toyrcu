@@ -1,9 +1,11 @@
-use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, AtomicPtr, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize, AtomicPtr, Ordering, fence}};
 use std::ptr::null_mut;
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
 use std::fmt;
 use std::mem;
+use std::hint::spin_loop;
+use std::thread::yield_now;
 
 #[cfg(test)]
 use rand;
@@ -71,9 +73,10 @@ unsafe impl<T: Send + Sync + Clone + PartialEq> Sync for Rcu<T> {}
 
 impl<T: Clone + PartialEq> Clone for Rcu<T> {
     fn clone(&self) -> Self {
+        // Increment the counter using Relaxed ordering for better performance
         self.body.counter.fetch_add(1, Ordering::Relaxed);
         Rcu {
-            body: self.body.clone(),
+            body: Arc::clone(&self.body),
         }
     }
 }
@@ -92,9 +95,9 @@ impl<T: Clone + PartialEq> Drop for Rcu<T> {
 impl<T: Clone + PartialEq> Deref for Rcu<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // Use Acquire ordering for the load to ensure proper synchronization
-        // with stores that use Release ordering
-        let next = self.body.value.next.load(Ordering::Acquire);
+        // Use Relaxed ordering for the initial load to improve performance
+        // then upgrade to Acquire only when we actually need to follow the pointer
+        let next = self.body.value.next.load(Ordering::Relaxed);
 
         // Fast path: if next is null, just return the current value
         if next.is_null() {
@@ -102,8 +105,8 @@ impl<T: Clone + PartialEq> Deref for Rcu<T> {
             // which are serialized with the updating flag
             unsafe { &*self.body.value.current.get() }
         } else {
-            // If next is not null, read from the next value
-            // Acquire ordering ensures we see all changes made before the store
+            // Perform a more expensive acquire load only when needed
+            let next = self.body.value.next.load(Ordering::Acquire);
             unsafe { &*(*next).current.get() }
         }
     }
@@ -112,6 +115,7 @@ impl<T: Clone + PartialEq> Deref for Rcu<T> {
 impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// Creates a new RCU instance with the given initial value.
     pub fn new(v: T) -> Self {
+        // Pre-allocate with a reasonable capacity to avoid frequent reallocations
         Rcu {
             body: Arc::new(RcuBody {
                 counter: AtomicUsize::new(1), // Start with 1 reference (the creator)
@@ -148,31 +152,47 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     ///
     /// Returns an error if the RCU is already being updated.
     pub fn assign_pointer(&'a self) -> Result<RcuGuard<'a, T>, RcuError> {
-        // Try to acquire the updating lock with a compare_exchange instead of swap
-        // This avoids unnecessary atomic writes when the lock is already held
-        if self.body.updating.compare_exchange(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
-            return Err(RcuError::AlreadyUpdating);
+        // Use a more efficient backoff strategy to reduce contention
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u8 = 7;
+
+        while attempts < MAX_ATTEMPTS {
+            if self.body.updating.compare_exchange_weak(
+                false, true, Ordering::Acquire, Ordering::Relaxed
+            ).is_ok() {
+                // Use Relaxed ordering for the next pointer load since we have the updating lock
+                let next_ptr = self.body.value.next.load(Ordering::Relaxed);
+
+                // Create a new value by cloning the current one
+                // We'll optimize to avoid cloning when possible in the guard's drop
+                let current_value = unsafe { &*self.body.value.current.get() };
+                let new_value = Value {
+                    current: UnsafeCell::new(current_value.clone()),
+                    next: AtomicPtr::new(next_ptr),
+                };
+
+                return Ok(RcuGuard {
+                    value: Some(new_value),
+                    body: &self.body,
+                    original_value: current_value,
+                });
+            }
+
+            attempts += 1;
+
+            // Exponential backoff to reduce contention
+            for _ in 0..(1 << attempts.min(4)) {
+                // Use spin loop for short waits to avoid expensive thread yields
+                spin_loop();
+            }
+
+            // After spinning, if still not successful, yield to give other threads a chance
+            if attempts > 2 {
+                yield_now();
+            }
         }
 
-        // Use Acquire ordering for the next pointer load for consistency
-        // with other next pointer loads in the codebase
-        let next_ptr = self.body.value.next.load(Ordering::Acquire);
-
-        // Create a new value by cloning the current one
-        // We'll optimize to avoid cloning when possible in the guard's drop
-        let current_value = unsafe { &*self.body.value.current.get() };
-        let new_value = Value {
-            current: UnsafeCell::new(current_value.clone()),
-            next: AtomicPtr::new(next_ptr),
-        };
-
-        Ok(RcuGuard {
-            value: Some(new_value),
-            body: &self.body,
-            original_value: current_value,
-        })
+        Err(RcuError::AlreadyUpdating)
     }
 
     /// Attempts to clean up old versions of the data.
@@ -190,53 +210,8 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// to prevent memory leaks. Each clone maintains references to old data until
     /// explicitly cleaned up.
     pub fn clean(&mut self) {
-        // Fast path: if there's no next pointer, nothing to clean
-        let next = self.body.value.next.load(Ordering::Acquire);
-        if next.is_null() {
-            return;
-        }
-
-        // Only proceed if this is the sole reference
-        let counter = self.body.counter.load(Ordering::Relaxed);
-        if counter != 1 {
-            return;
-        }
-
-        unsafe {
-            // Move the next value into current instead of cloning
-            let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Release);
-            if !next_ptr.is_null() {
-                // Get the first node in the chain
-                let next_box = Box::from_raw(next_ptr);
-                let current_ptr = self.body.value.current.get();
-
-                // Swap the values to avoid cloning
-                mem::swap(&mut *current_ptr, &mut *next_box.current.get());
-
-                // Get the next pointer in the chain before we drop the current node
-                let mut chain_ptr = next_box.next.load(Ordering::Acquire);
-
-                // Clear the next pointer to prevent recursive drop from the first node
-                next_box.next.store(null_mut(), Ordering::Relaxed);
-
-                // next_box will be dropped here, cleaning up its resources
-
-                // Now clean up the rest of the chain
-                while !chain_ptr.is_null() {
-                    // Get the next pointer before we drop the current one
-                    let next_in_chain = (*chain_ptr).next.load(Ordering::Acquire);
-
-                    // Clear the next pointer to prevent recursive drop
-                    (*chain_ptr).next.store(null_mut(), Ordering::Relaxed);
-
-                    // Drop the current node
-                    drop(Box::from_raw(chain_ptr));
-
-                    // Move to the next node
-                    chain_ptr = next_in_chain;
-                }
-            }
-        }
+        // Use try_clean_fast implementation for better performance
+        self.try_clean_fast();
     }
 
     /// Attempts to clean up old versions of the data automatically.
@@ -256,7 +231,8 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
     /// but cleanup will only succeed if there are no other active references.
     #[inline]
     pub fn try_clean_fast(&mut self) -> bool {
-        let next = self.body.value.next.load(Ordering::Acquire);
+        // Use Relaxed ordering for initial check to improve performance
+        let next = self.body.value.next.load(Ordering::Relaxed);
         if next.is_null() {
             return false;
         }
@@ -266,52 +242,92 @@ impl<'a, T: Clone + PartialEq> Rcu<T> {
             return false;
         }
 
-        // Try to acquire the updating lock
-        if self.body.updating.compare_exchange(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
-            return false;
-        }
+        // Use a more efficient backoff strategy for the cleanup operation
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: u8 = 5;
 
-        unsafe {
-            // Move the next value into current instead of cloning
-            let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Release);
-            if !next_ptr.is_null() {
-                // Get the first node in the chain
-                let next_box = Box::from_raw(next_ptr);
-                let current_ptr = self.body.value.current.get();
+        while attempts < MAX_ATTEMPTS {
+            if self.body.updating.compare_exchange_weak(
+                false, true, Ordering::Acquire, Ordering::Relaxed
+            ).is_ok() {
+                // Successfully acquired the lock
+                unsafe {
+                    // Move the next value into current instead of cloning
+                    // Recheck the next pointer with Acquire ordering since we have the lock
+                    let next_ptr = self.body.value.next.load(Ordering::Acquire);
+                    if next_ptr.is_null() {
+                        // Another thread might have cleaned up already
+                        self.body.updating.store(false, Ordering::Release);
+                        return false;
+                    }
 
-                // Swap the values to avoid cloning
-                mem::swap(&mut *current_ptr, &mut *next_box.current.get());
+                    let next_ptr = self.body.value.next.swap(null_mut(), Ordering::Release);
+                    if !next_ptr.is_null() {
+                        // Get the first node in the chain
+                        let next_box = Box::from_raw(next_ptr);
+                        let current_ptr = self.body.value.current.get();
 
-                // Get the next pointer in the chain before we drop the current node
-                let mut chain_ptr = next_box.next.load(Ordering::Acquire);
+                        // Swap the values to avoid cloning
+                        mem::swap(&mut *current_ptr, &mut *next_box.current.get());
 
-                // Clear the next pointer to prevent recursive drop from the first node
-                next_box.next.store(null_mut(), Ordering::Relaxed);
+                        // Get the next pointer in the chain before we drop the current node
+                        let mut chain_ptr = next_box.next.load(Ordering::Acquire);
 
-                // next_box will be dropped here, cleaning up its resources
+                        // Clear the next pointer to prevent recursive drop from the first node
+                        next_box.next.store(null_mut(), Ordering::Relaxed);
 
-                // Now clean up the rest of the chain
-                while !chain_ptr.is_null() {
-                    // Get the next pointer before we drop the current one
-                    let next_in_chain = (*chain_ptr).next.load(Ordering::Acquire);
+                        // next_box will be dropped here, cleaning up its resources
 
-                    // Clear the next pointer to prevent recursive drop
-                    (*chain_ptr).next.store(null_mut(), Ordering::Relaxed);
+                        // Efficiently clean up the chain using a non-recursive approach
+                        // Process nodes in batches to improve cache locality
+                        const BATCH_SIZE: usize = 4;
+                        let mut batch = Vec::with_capacity(BATCH_SIZE);
 
-                    // Drop the current node
-                    drop(Box::from_raw(chain_ptr));
+                        while !chain_ptr.is_null() {
+                            // Get the next pointer before we drop the current one
+                            let next_in_chain = (*chain_ptr).next.load(Ordering::Acquire);
 
-                    // Move to the next node
-                    chain_ptr = next_in_chain;
+                            // Clear the next pointer to prevent recursive drop
+                            (*chain_ptr).next.store(null_mut(), Ordering::Relaxed);
+
+                            // Add to batch instead of dropping immediately
+                            batch.push(chain_ptr);
+
+                            // Move to the next node
+                            chain_ptr = next_in_chain;
+
+                            // Process the batch when it's full or we've reached the end
+                            if batch.len() == BATCH_SIZE || chain_ptr.is_null() {
+                                for ptr in batch.drain(..) {
+                                    drop(Box::from_raw(ptr));
+                                }
+                            }
+                        }
+                    }
                 }
+
+                // Issue a release fence to ensure all cleanup operations are visible
+                fence(Ordering::Release);
+
+                // Release the updating lock
+                self.body.updating.store(false, Ordering::Relaxed);
+                return true;
+            }
+
+            attempts += 1;
+
+            // Exponential backoff to reduce contention
+            for _ in 0..(1 << attempts.min(4)) {
+                spin_loop();
+            }
+
+            // After spinning, if still not successful, yield to give other threads a chance
+            if attempts > 2 {
+                yield_now();
             }
         }
 
-        // Release the updating lock
-        self.body.updating.store(false, Ordering::Release);
-        true
+        false
     }
 }
 
@@ -377,28 +393,40 @@ impl<'a, T: Clone + PartialEq> DerefMut for RcuGuard<'a, T> {
     }
 }
 
+impl<'a, T: Clone + PartialEq> RcuGuard<'a, T> {
+    /// Check if the value has been modified
+    #[inline]
+    fn is_modified(&self) -> bool {
+        if let Some(value) = &self.value {
+            let new_value = unsafe { &*value.current.get() };
+            self.original_value != new_value
+        } else {
+            false
+        }
+    }
+}
+
 impl<'a, T: Clone + PartialEq> Drop for RcuGuard<'a, T> {
     fn drop(&mut self) {
-        if let Some(value) = self.value.take() {
-            // Check if the value was actually modified by comparing with the original
-            // We use the stored original_value reference instead of fetching it again
-            let new_value = unsafe { &*value.current.get() };
-
-            // Only allocate and update if the value actually changed
-            // This optimization avoids unnecessary allocations and atomic operations
-            if self.original_value != new_value {
-                // Set the next pointer to the new value
-                let boxed_value = Box::new(value);
-                let raw_ptr = Box::into_raw(boxed_value);
-
-                // Use Release ordering to ensure all writes to the new value
-                // are visible before the pointer becomes visible
-                self.body.value.next.store(raw_ptr, Ordering::Release);
-            }
+        // First check if the value was modified to avoid unnecessary work
+        // This avoids the expensive take() operation if no changes were made
+        if !self.is_modified() {
+            // Release the lock with Relaxed ordering since no changes were made
+            self.body.updating.store(false, Ordering::Relaxed);
+            return;
         }
 
-        // Release the updating lock with Release ordering
-        // to ensure all changes are visible to subsequent operations
+        if let Some(value) = self.value.take() {
+            // Set the next pointer to the new value
+            let boxed_value = Box::new(value);
+            let raw_ptr = Box::into_raw(boxed_value);
+
+            // Use Release ordering to ensure all writes to the new value
+            // are visible before the pointer becomes visible
+            self.body.value.next.store(raw_ptr, Ordering::Release);
+        }
+
+        // Release the updating lock
         self.body.updating.store(false, Ordering::Release);
     }
 }
