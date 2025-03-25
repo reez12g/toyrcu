@@ -359,6 +359,8 @@ impl<T: Clone + PartialEq> Drop for Value<T> {
         // This prevents potential double-free issues when we manually clean up chains.
         let next = self.next.load(Ordering::Acquire);
         if !next.is_null() {
+            // Set the next pointer to null to avoid double free
+            self.next.store(null_mut(), Ordering::Release);
             // Free the memory of the next value
             unsafe { drop(Box::from_raw(next)) };
         }
